@@ -1,0 +1,104 @@
+// -------------------------------------------------------
+// CloudPulse Infra — DESTROY pipeline (separate from create)
+//
+// This is intentionally a separate job so that tearing down
+// infrastructure is a deliberate, explicit action — never an
+// accidental option inside the normal apply/plan pipeline.
+//
+// Create a Jenkins job pointing its Script Path to:
+//   jenkins/Jenkinsfile.destroy
+// -------------------------------------------------------
+pipeline {
+    agent any
+
+    environment {
+        // ---- Central config (change here, applies everywhere) ----
+        AWS_REGION   = 'ap-south-1'
+        GIT_REPO     = 'https://github.com/rajeshdangi409/cloudpulse-infra.git'
+        NOTIFY_EMAIL = credentials('notify-email')
+        CLUSTER_NAME = 'cloudpulse-cluster'
+    }
+
+    options {
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: "${GIT_REPO}"
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform init'
+                }
+            }
+        }
+
+        stage('Cleanup Kubernetes (safety)') {
+            // Flux and the app's LoadBalancer are NOT in Terraform state, so
+            // Terraform can't delete them. If they are left running, the real
+            // AWS ELB blocks VPC deletion (DependencyViolation) and keeps
+            // costing money. We remove them here BEFORE destroying the infra.
+            // Everything is best-effort (|| true) in case the cluster/app is
+            // already gone (e.g. app cleanup pipeline ran first).
+            steps {
+                sh '''
+                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME} || true
+
+                    # 1. Remove Flux so it can't self-heal the app back
+                    flux uninstall --silent || true
+
+                    # 2. Delete the app namespace — this repo has no k8s/ files
+                    #    (those live in cloudpulse-app), so we delete by namespace.
+                    #    Removing the namespace also tears down the Service /
+                    #    AWS LoadBalancer that lives inside it.
+                    kubectl delete namespace cloudpulse --ignore-not-found=true || true
+
+                    # 3. Give the ELB / ENIs time to actually delete before VPC destroy
+                    sleep 60
+                '''
+            }
+        }
+
+        stage('Plan Destroy') {
+            steps {
+                dir('terraform') {
+                    // Show exactly what will be destroyed before asking for approval
+                    sh 'terraform plan -destroy'
+                }
+            }
+        }
+
+        stage('Confirm Destroy') {
+            steps {
+                input message: "⚠️ This will DESTROY all CloudPulse infrastructure (EKS, VPC, ECR). Are you sure?",
+                      ok: 'Yes, Destroy Everything'
+            }
+        }
+
+        stage('Terraform Destroy') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform destroy -auto-approve'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            mail to: "${NOTIFY_EMAIL}",
+                 subject: "✅ Infra DESTROY #${BUILD_NUMBER} Success",
+                 body: "All CloudPulse infrastructure was destroyed successfully.\n\nBuild: ${BUILD_URL}"
+        }
+        failure {
+            mail to: "${NOTIFY_EMAIL}",
+                 subject: "❌ Infra DESTROY #${BUILD_NUMBER} Failed",
+                 body: "Terraform destroy failed!\n\nCheck logs: ${BUILD_URL}"
+        }
+    }
+}

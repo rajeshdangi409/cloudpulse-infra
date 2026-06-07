@@ -1,0 +1,22 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+tfplan
+
+# NOTE: terraform.tfvars IS committed for this infra repo on purpose.
+# Jenkins pulls this repo and runs `terraform apply`, so it needs these
+# values to override the variable defaults. This file holds only non-secret
+# config (CIDRs, names, sizes) — AWS auth comes from the Jenkins EC2 IAM role,
+# never from here. The actual private key (*.pem) is still ignored below.
+
+# Secrets / keys (never commit these)
+*.pem
+
+# Local backups
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
